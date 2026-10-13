@@ -1,0 +1,44 @@
+# DEMO/TEST OVERLAY - do not ship. Loaded as a second --config after config.yaml.
+# The collector deep-merges maps but REPLACES lists, so this file restates the lists it
+# extends (tail_sampling policies, pipeline exporters).
+#
+# Adds:
+#   1. A TEST-ONLY force-keep policy. demo.force_keep="true" is set on the Django
+#      server span (x-demo-force-keep: 1 header) and on the browser scenario span for
+#      S8/S9, so performance-issue test traffic is kept at 100% without lowering the
+#      latency threshold for everything.
+#   2. JSON copies of what went where (out/collector/all.jsonl, sentry.jsonl), used by
+#      scripts/verify_sentry.py to count spans per sink.
+processors:
+  tail_sampling:
+    policies:
+      # --- same as config.yaml ---
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow-server-span
+        type: ottl_condition
+        ottl_condition:
+          error_mode: ignore
+          span:
+            - 'kind == SPAN_KIND_SERVER and end_time_unix_nano - start_time_unix_nano >= ${env:TAIL_LATENCY_MS:-1000} * 1000000'
+      # --- test only ---
+      - name: force-keep-test-only
+        type: string_attribute
+        string_attribute:
+          key: demo.force_keep
+          values: ["true"]
+
+exporters:
+  file/all:
+    path: /out/collector/all.jsonl
+  file/sentry:
+    path: /out/collector/sentry.jsonl
+
+service:
+  pipelines:
+    traces/all:
+      exporters: [otlp/trace_store, file/all]
+    traces/sentry:
+      exporters: [routing/sentry, file/sentry]

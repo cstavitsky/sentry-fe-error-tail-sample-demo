@@ -1,0 +1,215 @@
+# OpenTelemetry Collector (otelcol-contrib 0.120.0): tail-based sampling into Sentry.
+#
+# THIS FILE IS THE CUSTOMER CONFIG. It has no demo/test parts. The demo loads
+# `demo.yaml` as a second --config on top of it (file exporters + a test-only
+# force-keep policy); see docker-compose.yml.
+#
+#   traces/all     : every span -> existing trace store (Jaeger here, 100%)
+#   traces/sentry  : tail_sampling -> drop FE error-marker spans -> route by service.name
+#                      demo-frontend      -> Sentry FE project (OTLP)
+#                      everything else    -> Sentry BE project (OTLP)
+#
+# Env vars:
+#   SENTRY_OTLP_FE_ENDPOINT / SENTRY_OTLP_BE_ENDPOINT   (required)
+#       https://o<orgId>.ingest.sentry.io/api/<projectId>/integration/otlp/v1/traces
+#   SENTRY_OTLP_FE_AUTH / SENTRY_OTLP_BE_AUTH            (required)
+#       "sentry sentry_key=<public key>"   (full x-sentry-auth header value)
+#   TRACE_STORE_ENDPOINT  OTLP/gRPC endpoint of the existing trace store (default jaeger:4317)
+#   TAIL_LATENCY_MS       "slow" threshold for SERVER spans (default 1000)
+#   DECISION_WAIT         tail-sampling decision wait (default 30s)
+#   (`${env:VAR:-default}` defaults apply only when VAR is unset, not when it is empty.)
+#
+# SIZING
+#   num_traces  >= new traces/s x decision_wait (s) x 2. Too small and undecided traces
+#               are evicted and silently dropped. Watch these metrics:
+#                 otelcol_processor_tail_sampling_sampling_trace_dropped_too_early
+#                 otelcol_processor_tail_sampling_sampling_trace_removal_age
+#                 otelcol_processor_tail_sampling_sampling_late_span_age
+#   memory      memory_limiter uses a percentage of the container/cgroup memory limit,
+#               so ALWAYS run the collector with a memory limit (compose: mem_limit).
+#
+# SCALING (not implemented here): tail sampling needs every span of a trace on the SAME
+# collector instance. With more than one replica, put a first tier in front that has NO
+# tail_sampling and uses the `loadbalancing` exporter keyed by trace ID. That first tier
+# must receive ALL traffic, including the browser's /otlp traffic:
+#
+#   exporters:
+#     loadbalancing:
+#       routing_key: traceID
+#       protocol:
+#         otlp:
+#           tls: { insecure: true }
+#       resolver:
+#         dns: { hostname: otel-sampler-headless.observability.svc.cluster.local, port: 4317 }
+#
+# and run this config (tail_sampling) on the second tier.
+#
+# PRODUCTION HARDENING for the public browser route (see README "Production hardening"):
+# give browser traffic its own receiver and force its resource attributes, e.g.
+#
+#   receivers:
+#     otlp/browser:
+#       protocols: { http: { endpoint: 0.0.0.0:4319 } }   # nginx /otlp -> :4319
+#   processors:
+#     resource/browser:            # nobody can claim to be a backend service from a browser
+#       attributes:
+#         - { key: service.name, value: demo-frontend, action: upsert }
+#     transform/browser:           # strip attributes a browser must not control
+#       error_mode: ignore
+#       trace_statements:
+#         - context: span
+#           statements:
+#             - delete_key(attributes, "demo.force_keep")
+#   connectors:
+#     forward/browser: {}
+#   service:
+#     pipelines:
+#       traces/browser_in:
+#         receivers: [otlp/browser]
+#         processors: [memory_limiter, resource/browser, transform/browser]
+#         exporters: [forward/browser]
+#       # ...and add forward/browser to the receivers of traces/all and traces/sentry.
+
+extensions:
+  # Liveness/readiness endpoint for k8s probes: GET :13133/
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        # No CORS block needed: the browser posts to same-origin /otlp and nginx proxies
+        # it here, so the collector itself is never exposed to the internet.
+
+processors:
+  # Must be the first processor in every pipeline.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 1s
+
+  # Sentry builds "segments" from spans and closes one ~10s after its last span, so
+  # export each sampled trace promptly and in one go.
+  batch/sentry:
+    timeout: 1s
+    send_batch_size: 512
+
+  tail_sampling:
+    # Must exceed: FE idle-span finalization + browser span-buffer flush + FE error
+    # delay after the page-load span ended. Errors that happen LATER than this after the
+    # trace's first span can no longer pull the trace in (see README limitations).
+    decision_wait: ${env:DECISION_WAIT:-30s}
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    decision_cache:
+      # Remember "keep" decisions after the span data was released, so late spans of a
+      # KEPT trace still reach Sentry. Keep much larger than num_traces (trace ids only).
+      # No non_sampled cache on purpose: it would also block late error markers.
+      sampled_cache_size: 500000
+    # NOTE: lists are replaced, not merged, when a second --config file is loaded:
+    # demo.yaml restates these policies and adds its test-only one. Keep them in sync.
+    policies:
+      # Keep every trace that has an error anywhere (FE marker span, Django, Go).
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      # Keep traces with a slow SERVER span (the request your backend served).
+      # Deliberately NOT the `latency` policy: that measures the whole trace (earliest
+      # start -> latest end), and in an SPA every later fetch lands on the page-load
+      # trace, so almost every real page-load trace would look "slow".
+      # Must be <= the slow-DB request duration so every Slow DB trace is kept (that
+      # issue type needs 100 occurrences before it is created).
+      - name: slow-server-span
+        type: ottl_condition
+        ottl_condition:
+          error_mode: ignore
+          span:
+            - 'kind == SPAN_KIND_SERVER and end_time_unix_nano - start_time_unix_nano >= ${env:TAIL_LATENCY_MS:-1000} * 1000000'
+
+  # FE "error marker" spans exist only to tell the tail sampler that a browser error
+  # happened in this trace. Drop them after the decision so they never reach Sentry.
+  filter/drop_error_markers:
+    error_mode: ignore
+    traces:
+      span:
+        - 'name == "sentry.error_marker"'
+
+connectors:
+  # Sentry OTLP endpoints are per-project: route on the resource's service.name.
+  # Anything that doesn't match (including a typo in service.name) goes to the BE project.
+  routing/sentry:
+    default_pipelines: [traces/sentry_be]
+    error_mode: ignore
+    table:
+      - statement: route() where attributes["service.name"] == "demo-frontend"
+        pipelines: [traces/sentry_fe]
+
+exporters:
+  # Existing trace store (Honeycomb or similar; Jaeger in the demo).
+  otlp/trace_store:
+    endpoint: ${env:TRACE_STORE_ENDPOINT:-jaeger:4317}
+    tls:
+      insecure: true
+
+  # Sentry, per docs.sentry.io/concepts/otlp/forwarding/pipelines/collector/
+  otlphttp/sentry_fe:
+    traces_endpoint: ${env:SENTRY_OTLP_FE_ENDPOINT}
+    headers:
+      x-sentry-auth: ${env:SENTRY_OTLP_FE_AUTH}
+    compression: gzip
+    encoding: proto
+    # Absorb short Sentry ingest outages and 429s instead of dropping sampled traces.
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  otlphttp/sentry_be:
+    traces_endpoint: ${env:SENTRY_OTLP_BE_ENDPOINT}
+    headers:
+      x-sentry-auth: ${env:SENTRY_OTLP_BE_AUTH}
+    compression: gzip
+    encoding: proto
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces/all:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/trace_store]
+
+    traces/sentry:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, filter/drop_error_markers, batch/sentry]
+      exporters: [routing/sentry]
+
+    traces/sentry_fe:
+      receivers: [routing/sentry]
+      exporters: [otlphttp/sentry_fe]
+
+    traces/sentry_be:
+      receivers: [routing/sentry]
+      exporters: [otlphttp/sentry_be]

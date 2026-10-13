@@ -1,0 +1,20 @@
+# Web app
+Django==5.2.18
+gunicorn==23.0.0
+psycopg[binary]==3.3.6
+requests==2.32.3
+
+# OpenTelemetry: spans go to the OTel Collector (never to Sentry directly)
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-distro==0.66b1
+opentelemetry-instrumentation-django==0.66b1
+opentelemetry-instrumentation-psycopg==0.66b1
+opentelemetry-instrumentation-requests==0.66b1
+# Only used by the local (no Docker) harness, where Django runs on sqlite.
+opentelemetry-instrumentation-sqlite3==0.66b1
+
+# sentry-sdk is installed separately in the Dockerfile so its version can be
+# overridden with the SENTRY_PYTHON_VERSION build arg:
+#   pip install "sentry-sdk[opentelemetry-otlp]==${SENTRY_PYTHON_VERSION}"

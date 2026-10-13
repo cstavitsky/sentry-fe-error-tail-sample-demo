@@ -1,0 +1,113 @@
+# Tail-sampling demo. Fill in .env (copy .env.example), then:  make up && make demo
+name: tail-sample-demo
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+  OTEL_PROPAGATORS: tracecontext,baggage
+  # Honour the browser's sampled flag (the browser samples 100%); the collector tail-samples.
+  OTEL_TRACES_SAMPLER: parentbased_always_on
+  OTEL_BSP_SCHEDULE_DELAY: "1000"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=demo
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+      args:
+        VITE_SENTRY_DSN_FE: ${SENTRY_DSN_FE:-}
+        VITE_SENTRY_ORG: ${SENTRY_ORG:-}
+    ports: ["8080:80"]
+    depends_on: [backend, collector]
+
+  backend:
+    build:
+      context: backend
+      args:
+        SENTRY_PYTHON_VERSION: ${SENTRY_PYTHON_VERSION:-2.56.0}
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: demo-api
+      DJANGO_SETTINGS_MODULE: demo.settings
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      SENTRY_DSN_BE: ${SENTRY_DSN_BE:-}
+      BE_TRACING_MODE: ${BE_TRACING_MODE:-otlp}
+      FIX_LOG_SPAN_ID: ${FIX_LOG_SPAN_ID:-1}
+      GO_REPLICA_URL: http://go-replica:8090
+      BILLING_DELAY_MS: ${BILLING_DELAY_MS:-1800}
+    depends_on:
+      postgres: { condition: service_healthy }
+      go-replica: { condition: service_started }
+      collector: { condition: service_started }
+
+  go-replica:
+    build: go-replica
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: demo-go-replica
+      SENTRY_DSN_BE: ${SENTRY_DSN_BE:-}
+    depends_on: [collector]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    # config.yaml = the customer config (no demo parts). demo.yaml is the demo/test
+    # overlay: file exporters for verification + the test-only force-keep policy.
+    # COLLECTOR_OVERLAY=config.yaml runs the plain customer config (loading the same
+    # file twice is a no-op merge); verify_sentry.py then has no out/collector files.
+    command:
+      - --config=/etc/otelcol/config.yaml
+      - --config=/etc/otelcol/${COLLECTOR_OVERLAY:-demo.yaml}
+    volumes:
+      - ./collector:/etc/otelcol:ro
+      - ./out/collector:/out/collector
+    user: "0:0" # demo-only: lets the file exporters write to the ./out bind mount
+    # memory_limiter in config.yaml uses limit_percentage (80% / spike 20%) of THIS limit.
+    mem_limit: 1g
+    environment:
+      SENTRY_OTLP_FE_ENDPOINT: ${SENTRY_OTLP_FE_ENDPOINT:?set SENTRY_OTLP_FE_ENDPOINT in .env}
+      SENTRY_OTLP_FE_AUTH: ${SENTRY_OTLP_FE_AUTH:?set SENTRY_OTLP_FE_AUTH in .env}
+      SENTRY_OTLP_BE_ENDPOINT: ${SENTRY_OTLP_BE_ENDPOINT:?set SENTRY_OTLP_BE_ENDPOINT in .env}
+      SENTRY_OTLP_BE_AUTH: ${SENTRY_OTLP_BE_AUTH:?set SENTRY_OTLP_BE_AUTH in .env}
+      TRACE_STORE_ENDPOINT: jaeger:4317
+      TAIL_LATENCY_MS: ${TAIL_LATENCY_MS:-1000}
+      DECISION_WAIT: ${DECISION_WAIT:-30s}
+    ports:
+      - "4318:4318" # OTLP/HTTP (optional, for local debugging)
+      - "13133:13133" # health_check extension: curl localhost:13133
+    depends_on: [jaeger]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686"]
+
+  loadgen:
+    build: loadgen
+    profiles: ["tools"] # only started by `make demo|perf|mixed`
+    environment:
+      BASE_URL: http://nginx
+      OUT_DIR: /out/loadgen
+      BE_TRACING_MODE: ${BE_TRACING_MODE:-otlp}
+    volumes:
+      - ./out/loadgen:/out/loadgen
+    depends_on: [nginx]
