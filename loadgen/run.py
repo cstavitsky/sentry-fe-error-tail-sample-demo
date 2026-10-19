@@ -4,7 +4,7 @@ Playwright load generator: drives the demo UI like real users and writes a JSON
 record of every run (scenario, trace id, HTTP statuses, expected errors) to
 $OUT_DIR (default /out/loadgen) so a test can reconcile Sentry / Jaeger against it.
 
-  python run.py demo                 every scenario once (S1..S9, S6 via page reload)
+  python run.py demo                 every scenario once (S1..S9 + S12, S6 via page reload)
   python run.py scenario S2 [n]      one scenario n times (default 1)
   python run.py perf                 AC6 recipe: S8 x10, then S9 x120 (10 in parallel)
   python run.py mixed [n]            S11: n traces (default 500), ~90% S1
@@ -27,6 +27,8 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 ALL = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
+# Backend-only scenarios: plain HTTP from the loadgen, no browser, no traceparent.
+BACKEND_ONLY = {"S12"}
 MIXED_ERRORS_AND_SLOW = ["S2", "S3", "S4", "S5", "S7"]
 
 
@@ -76,6 +78,34 @@ async def run_fresh(browser, base_url, scenario):
 
 FRESH_PAGE = {"S5"}
 
+# Backend-only scenarios: a direct API call (like curl, a cron job or another service)
+# with NO traceparent header, so the trace begins in Django. Django returns the trace
+# id it started in `x-demo-trace-id` so the run can be reconciled.
+BACKEND_ONLY_SPEC = {
+    # S12: Django -> Go, Go fails, Django returns 502. Kept by the `errors` policy:
+    # Go + Django issues on a trace with no FE spans.
+    "S12": {"path": "/api/v1/models/2/deployments?replica_fail=1", "expectSentry": True, "errors": {"fe": 0, "be": 2}},
+}
+PW = None  # set in main(): the Playwright instance, for API requests outside a browser
+
+
+async def run_backend_only(base_url, scenario):
+    spec = BACKEND_ONLY_SPEC[scenario]
+    ctx = await PW.request.new_context(base_url=base_url)
+    try:
+        started = datetime.now(timezone.utc).isoformat()
+        r = await ctx.get(spec["path"])
+        return {
+            "scenario": scenario,
+            "traceId": r.headers.get("x-demo-trace-id", ""),
+            "startedAt": started,
+            "calls": [{"url": spec["path"], "status": r.status}],
+            "expectSentry": spec["expectSentry"],
+            "errors": dict(spec["errors"]),
+        }
+    finally:
+        await ctx.dispose()
+
 
 async def run_many(browser, base_url, scenarios, concurrency):
     """Run a list of scenario ids with N pages in parallel; returns results in order."""
@@ -94,6 +124,8 @@ async def run_many(browser, base_url, scenarios, concurrency):
             try:
                 if s == "S6":
                     results[i] = await run_s6(browser, base_url)
+                elif s in BACKEND_ONLY:
+                    results[i] = await run_backend_only(base_url, s)
                 elif s in FRESH_PAGE:
                     results[i] = await run_fresh(browser, base_url, s)
                 else:
@@ -137,11 +169,14 @@ async def main():
     t0 = time.time()
     phases = {}
 
+    global PW
     async with async_playwright() as p:
+        PW = p
         browser = await p.chromium.launch()
         if a.mode == "demo":
             phases["demo"] = await run_many(browser, base, [s for s in ALL if s != "S6"], 1)
             phases["demo"].append(await run_s6(browser, base))
+            phases["demo"].append(await run_backend_only(base, "S12"))
         elif a.mode == "scenario":
             sid = (a.args[0] if a.args else "S1").upper()
             n = int(a.args[1]) if len(a.args) > 1 else 1

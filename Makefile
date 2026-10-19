@@ -35,7 +35,7 @@ perf: dirs ## AC6: make perf MODE=otlp|sentry  (N+1 x10, Slow DB x120); always e
 mixed: dirs ## S11: make mixed N=500
 	$(COMPOSE) run --rm loadgen mixed $(N)
 
-fate: ## per-trace outcome (kept for Sentry vs trace store only): make fate RUN=demo|mixed
+fate: ## per-trace outcome (kept for Sentry vs trace store only): make fate RUN=demo|mixed|perf|scenario
 	python3 scripts/trace_fate.py --run $(or $(RUN),demo)
 
 logs: ## follow logs of all services

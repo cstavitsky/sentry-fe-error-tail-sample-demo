@@ -8,14 +8,27 @@ Reads the demo overlay's file-exporter copies:
 Usage:
   python3 scripts/trace_fate.py                 # latest `make demo` run, one line per scenario
   python3 scripts/trace_fate.py --run mixed     # latest `make mixed` run (summary + first rows)
+  python3 scripts/trace_fate.py --run scenario  # latest `make scenario S=..` run (e.g. S12)
   python3 scripts/trace_fate.py <trace_id> ...  # specific traces
 """
 import argparse
 import json
+import os
+import re
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 MARKER = "sentry.error_marker"
+
+
+def _decision_wait_s():
+    """Collector `decision_wait` (DECISION_WAIT env, default 30s) + a little slack for export."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(ms|s|m)?\s*", os.environ.get("DECISION_WAIT", "30s"))
+    if not m:
+        return 35.0
+    val = float(m.group(1)) * {"ms": 0.001, "s": 1, "m": 60, None: 1}[m.group(2)]
+    return val + 5
 
 
 def load(path):
@@ -34,23 +47,32 @@ def load(path):
                 for ss in rs.get("scopeSpans", []):
                     for sp in ss.get("spans", []):
                         per_trace[sp.get("traceId", "").lower()].append(
-                            (svc, sp.get("name", ""), (sp.get("status") or {}).get("code", 0)))
+                            (svc, sp.get("name", ""), (sp.get("status") or {}).get("code", 0),
+                             int(sp.get("startTimeUnixNano") or 0) / 1e9))
     return per_trace
 
 
 def describe(tid, allj, sent):
     a, s = allj.get(tid, []), sent.get(tid, [])
-    by_svc = Counter(svc for svc, _, _ in a)
-    errors = sorted({f"{svc}:{'error-marker' if name == MARKER else name}" for svc, name, code in a
+    by_svc = Counter(svc for svc, *_ in a)
+    errors = sorted({f"{svc}:{'error-marker' if name == MARKER else name}" for svc, name, code, _ in a
                      if code in (2, "STATUS_CODE_ERROR")})
-    fate = "KEPT -> Sentry" if s else ("DROPPED (store only)" if a else "not seen by collector")
+    if s:
+        fate = "KEPT -> Sentry"
+    elif not a:
+        fate = "not seen by collector"
+    elif time.time() - min(t for *_, t in a) < _decision_wait_s():
+        # The tail sampler hasn't decided yet (decision_wait after the trace's first span).
+        fate = "PENDING (re-run soon)"
+    else:
+        fate = "DROPPED (store only)"
     return fate, len(a), len(s), dict(by_svc), errors
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace_ids", nargs="*")
-    ap.add_argument("--run", default="demo", choices=["demo", "mixed", "perf"])
+    ap.add_argument("--run", default="demo", choices=["demo", "mixed", "perf", "scenario"])
     ap.add_argument("--out", default="out")
     ap.add_argument("--rows", type=int, default=15)
     a = ap.parse_args()
@@ -64,7 +86,14 @@ def main():
     if a.trace_ids:
         rows = [("-", t.lower().replace("-", "")) for t in a.trace_ids]
     else:
-        rep = json.loads((Path(a.out) / "loadgen" / f"{a.run}-latest.json").read_text())
+        report = Path(a.out) / "loadgen" / f"{a.run}-latest.json"
+        if not report.exists():
+            make = {"demo": "make demo", "mixed": "make mixed", "perf": "make perf",
+                    "scenario": "make scenario S=S12"}[a.run]
+            found = sorted(x.name.replace("-latest.json", "") for x in report.parent.glob("*-latest.json"))
+            hint = f" Reports present: {', '.join(found)} (use RUN=<name>)." if found else ""
+            raise SystemExit(f"no {report} - run `{make}` first, or pass trace ids.{hint}")
+        rep = json.loads(report.read_text())
         runs = [r for ph in rep["phases"].values() for r in ph if r and r.get("traceId")]
         rows = [(r["scenario"], r["traceId"].lower()) for r in runs]
 

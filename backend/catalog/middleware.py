@@ -27,3 +27,25 @@ class DemoForceKeepMiddleware:
                 span.set_attribute("demo.force_keep", "true")
             sentry_sdk.set_tag("demo.force_keep", "true")
         return self.get_response(request)
+
+
+TRACE_ID_HEADER = "x-demo-trace-id"
+
+
+class DemoTraceIdHeaderMiddleware:
+    """
+    Return the OTel trace id of the request as `x-demo-trace-id`.
+
+    Only needed so the loadgen can reconcile S12 (a backend-only request with no
+    incoming traceparent: the trace starts here, so the client can't know its id).
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        ctx = otel_trace.get_current_span().get_span_context()
+        if ctx.is_valid:
+            response[TRACE_ID_HEADER] = format(ctx.trace_id, "032x")
+        return response

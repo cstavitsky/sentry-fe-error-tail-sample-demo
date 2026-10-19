@@ -451,12 +451,12 @@ class Checker:
             return self.add("AC4", INCONC, "no demo-latest.json")
         sc = self.by_scenario(rep)
         start, end = window(rep)
-        want = {s: [r["traceId"] for r in sc.get(s, [])] for s in ("S2", "S3", "S4", "S5", "S6")}
+        want = {s: [r["traceId"] for r in sc.get(s, [])] for s in ("S2", "S3", "S4", "S5", "S6", "S12")}
         # Expected error events per trace, as recorded by the loadgen (S4: Django + Go = 2 BE errors).
         exp_err = {norm_id(r["traceId"]): (r.get("errors") or {}) for s in want for r in sc.get(s, [])}
         tids = [t for ts in want.values() for t in ts]
         if not tids:
-            return self.add("AC4", INCONC, "no S2-S6 runs")
+            return self.add("AC4", INCONC, "no S2-S6/S12 runs")
         sent = self.col["sentry"]
         allj = self.col["all"]
 
@@ -491,6 +491,8 @@ class Checker:
                     problems.append("no BE spans")
                 if s == "S4" and be_n == 0:
                     problems.append("no BE spans")
+                if s == "S12" and (be_n == 0 or fe_n > 0):
+                    problems.append(f"expected a backend-only trace (FE={fe_n}, BE={be_n})")
                 # Errors must be ON this trace (catches e.g. Go errors landing on a random trace).
                 te = errs.get(norm_id(t), [])
                 ee = exp_err.get(norm_id(t), {})
@@ -498,11 +500,11 @@ class Checker:
                 be_e = sum(1 for e in te if e.get("project") == self.be)
                 if fe_e < ee.get("fe", 0) or be_e < ee.get("be", 0):
                     problems.append(f"errors on trace FE {fe_e}/{ee.get('fe', 0)} BE {be_e}/{ee.get('be', 0)}"
-                                    + (" (S4 needs Django + Go)" if s == "S4" else ""))
+                                    + (" (S4/S12 need Django + Go)" if s in ("S4", "S12") else ""))
                 rows.append(f"{s} {t[:8]}: spans FE={fe_n} BE={be_n} expected={exp}/{all_n}, errors FE={fe_e} BE={be_e}" + (f" !! {', '.join(problems)}" if problems else ""))
                 if problems:
                     bad.append(t)
-        self.add("AC4", PASS if not bad else FAIL, f"{len(tids) - len(bad)}/{len(tids)} S2-S6 traces complete in Sentry; " + "; ".join(rows),
+        self.add("AC4", PASS if not bad else FAIL, f"{len(tids) - len(bad)}/{len(tids)} S2-S6 + S12 traces complete in Sentry; " + "; ".join(rows),
                  [self.trace_url(t) for t in (bad or tids)[:5]])
 
     def ac5(self):

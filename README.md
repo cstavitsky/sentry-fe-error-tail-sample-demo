@@ -155,6 +155,7 @@ With the demo overlay (`collector/demo.yaml`, the default), the collector also w
 | S8 | `GET /api/v1/models/1/deployment-history`: 1 source query + 12 identical per-row queries (≈ 120 ms total) | trace (force-keep) + N+1 issue? | full |
 | S9 | `GET /api/v1/deployments/status-report`: `SELECT pg_sleep(1.2)` | trace (force-keep + slow server span) + Slow DB issue? | full |
 | S10 | Django logs inside S2/S3/S4/S7 requests | logs on the same trace | – |
+| S12 | Backend-only: a direct `GET /api/v1/models/2/deployments?replica_fail=1` from the loadgen (no browser, no `traceparent`). The trace starts in Django; Go fails, Django returns 502 | Go + Django issues + full **backend-only** trace (no FE spans) | full |
 | S11 | `make mixed`: 500 traces, ~90 % S1 | only non-S1 traces | 100 % |
 
 S8 and S9 send `x-demo-force-keep: 1`. Django puts `demo.force_keep="true"` on its server span, the browser puts it on its scenario span, and a **test-only** collector policy (in `collector/demo.yaml`) keeps those traces.

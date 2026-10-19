@@ -19,6 +19,8 @@ MIDDLEWARE = [
     # Demo-only: copies the `x-demo-force-keep` request header onto the server span
     # so the collector's (test-only) string_attribute policy can keep the trace.
     "catalog.middleware.DemoForceKeepMiddleware",
+    # Demo-only: returns the request's OTel trace id (used by the loadgen for S12).
+    "catalog.middleware.DemoTraceIdHeaderMiddleware",
 ]
 
 ROOT_URLCONF = "demo.urls"
