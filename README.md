@@ -156,9 +156,47 @@ With the demo overlay (`collector/demo.yaml`, the default), the collector also w
 | S9 | `GET /api/v1/deployments/status-report`: `SELECT pg_sleep(1.2)` | trace (force-keep + slow server span) + Slow DB issue? | full |
 | S10 | Django logs inside S2/S3/S4/S7 requests | logs on the same trace | – |
 | S12 | Backend-only: a direct `GET /api/v1/models/2/deployments?replica_fail=1` from the loadgen (no browser, no `traceparent`). The trace starts in Django; Go fails, Django returns 502 | Go + Django issues + full **backend-only** trace (no FE spans) | full |
+| S13 | Backend-only, no error: a direct `GET /api/v1/models` from the loadgen (no browser, no `traceparent`). Django only, fast 200 | **no trace** (dropped by tail sampling) | full |
 | S11 | `make mixed`: 500 traces, ~90 % S1 | only non-S1 traces | 100 % |
 
 S8 and S9 send `x-demo-force-keep: 1`. Django puts `demo.force_keep="true"` on its server span, the browser puts it on its scenario span, and a **test-only** collector policy (in `collector/demo.yaml`) keeps those traces.
+
+### Variant: browser spans straight to Sentry (`FE_SPANS=sentry`)
+
+For apps with low frontend traffic, a simpler option is to skip the custom transport and send 100% of browser spans to Sentry with the stock SDK. The browser still sends `traceparent`, so the backend continues the same trace; only the **backend** spans go through the collector's tail sampler.
+
+```
+make fe-mode FE=sentry      # rebuild the frontend without the split transport (sticky)
+make demo                   # (or make scenario S=S5)
+make fate                   # prints the mode the run actually used; outcome is for BE spans only
+make fe-mode FE=otlp        # back to the default
+```
+
+`make fe-mode` saves the choice in `.fe_spans`, and every later `make` target builds the frontend in that mode. Plain `docker compose up --build` does not read `.fe_spans`: use the `make` targets, or set `FE_SPANS=` in `.env`.
+
+| ID | Expected in Sentry with `FE_SPANS=sentry` | Why |
+|---|---|---|
+| S1 | FE-only trace (browser spans, no BE spans) | FE is 100%; collector drops the error-free BE spans |
+| S2, S3, S4 | BE issue(s) + full FE + BE trace | BE error keeps the BE spans; they join the FE spans by trace id |
+| S5, S6 | FE issue + **FE spans only, no BE spans** | the FE error never reaches the collector, so it drops the BE spans |
+| S7 | full FE + BE trace | slow BE server span keeps the BE spans |
+| S8, S9 | full FE + BE trace + perf issue | kept by BE span attributes (force-keep, slow span) |
+| S12 | unchanged (backend-only) | no browser involved |
+| S13 | unchanged: **no trace**, also with `KEEP_BROWSER_TRACES=1` | backend-only, no error: no policy matches |
+
+#### Option: keep the BE spans of every browser trace (`KEEP_BROWSER_TRACES=1`)
+
+This closes the S5/S6 gap without the custom transport. `demo/keep_browser_traces.py` (Django middleware) puts `sentry.browser_trace="true"` on the server span when the request carries a sampled `sentry-trace` header for the same trace, i.e. it was started by the browser SDK. The collector's `browser-traces` policy (`string_attribute`, in `collector/config.yaml`) then keeps the whole trace, Go spans included. Backend-only traffic (cron jobs, service-to-service, S12) carries no `sentry-trace` and is still tail-sampled.
+
+```
+make fe-mode FE=sentry
+make keep-browser ON=1      # recreate Django with the middleware (sticky; ON=0 to turn off)
+make demo                   # ~30s later: make fate
+```
+
+With it on, S1, S5 and S6 become `KEPT (browser trace)` in `make fate` while S13 stays `DROPPED`: every browser-started trace is complete in Sentry (FE spans from the SDK, BE spans from the collector), while backend-only traces are still kept only on errors or slowness. The cost is that BE spans of **all** browser traffic go to Sentry, so this fits apps whose browser traffic is a small share of backend traffic. Do not combine it with `FE_SPANS=otlp`: browser requests carry `sentry-trace` in that mode too, so every browser trace would be kept.
+
+Keep `tracesSampleRate: 1.0` in this variant: the backend uses `parentbased_always_on`, so an unsampled browser request (`traceparent …-00`) would record no BE spans at all, even when the BE errors. `scripts/verify_sentry.py` assumes the default `FE_SPANS=otlp` (its S1/S5/S6 checks will fail in this mode).
 
 ## How each piece is configured
 

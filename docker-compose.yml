@@ -1,5 +1,5 @@
 # Tail-sampling demo. Fill in .env (copy .env.example), then:  make up && make demo
-name: tail-sample-demo
+name: fe-error-tail-sample-demo  # distinct from ../tail-sample-demo, so the two never share images or containers
 
 x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
@@ -21,6 +21,7 @@ services:
       args:
         VITE_SENTRY_DSN_FE: ${SENTRY_DSN_FE:-}
         VITE_SENTRY_ORG: ${SENTRY_ORG:-}
+        VITE_FE_SPANS: ${FE_SPANS:-otlp}
     ports: ["8080:80"]
     depends_on: [backend, collector]
 
@@ -40,6 +41,7 @@ services:
       SENTRY_DSN_BE: ${SENTRY_DSN_BE:-}
       BE_TRACING_MODE: ${BE_TRACING_MODE:-otlp}
       FIX_LOG_SPAN_ID: ${FIX_LOG_SPAN_ID:-1}
+      KEEP_BROWSER_TRACES: ${KEEP_BROWSER_TRACES:-0}
       GO_REPLICA_URL: http://go-replica:8090
       BILLING_DELAY_MS: ${BILLING_DELAY_MS:-1800}
     depends_on:

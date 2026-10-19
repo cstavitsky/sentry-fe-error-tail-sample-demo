@@ -23,6 +23,13 @@ MIDDLEWARE = [
     "catalog.middleware.DemoTraceIdHeaderMiddleware",
 ]
 
+# Opt-in (KEEP_BROWSER_TRACES=1): tag requests from sampled browser traces so the
+# collector's `browser-traces` policy keeps their BE spans. For FE_SPANS=sentry; see
+# demo/keep_browser_traces.py and README "Variant: browser spans straight to Sentry".
+KEEP_BROWSER_TRACES = os.environ.get("KEEP_BROWSER_TRACES", "0").strip() in ("1", "true", "yes")
+if KEEP_BROWSER_TRACES:
+    MIDDLEWARE.append("demo.keep_browser_traces.KeepBrowserTracesMiddleware")
+
 ROOT_URLCONF = "demo.urls"
 WSGI_APPLICATION = "demo.wsgi.application"
 

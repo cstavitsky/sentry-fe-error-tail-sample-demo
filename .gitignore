@@ -1,4 +1,6 @@
 .env
+.fe_spans
+.keep_browser_traces
 out/
 node_modules/
 frontend/dist/

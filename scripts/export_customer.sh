@@ -21,7 +21,7 @@ mkdir -p "$DEST"
   | (cd "$DEST" && tar -xf -)
 
 cd "$DEST"
-rm -rf SPEC.md REVIEW.md TEST_REPORT.md out frontend/dist tests/local/fake_sentry_api.py .env
+rm -rf SPEC.md REVIEW.md TEST_REPORT.md out frontend/dist tests/local/fake_sentry_api.py .env .fe_spans .keep_browser_traces
 find . -name '*.pyc' -exec rm -f {} +
 find . -name '.DS_Store' -exec rm -f {} +
 if [ -d research ]; then

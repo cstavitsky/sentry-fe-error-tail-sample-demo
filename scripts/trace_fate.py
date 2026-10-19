@@ -46,22 +46,36 @@ def load(path):
                             if a.get("key") == "service.name"), "?")
                 for ss in rs.get("scopeSpans", []):
                     for sp in ss.get("spans", []):
+                        browser = any(at.get("key") == "sentry.browser_trace" for at in sp.get("attributes", []))
                         per_trace[sp.get("traceId", "").lower()].append(
                             (svc, sp.get("name", ""), (sp.get("status") or {}).get("code", 0),
-                             int(sp.get("startTimeUnixNano") or 0) / 1e9))
+                             int(sp.get("startTimeUnixNano") or 0) / 1e9, browser))
     return per_trace
+
+
+def rep_mode_sentry(a, rows, allj):
+    """True if the run claims FE_SPANS=sentry but browser spans showed up in the collector."""
+    if a.trace_ids:
+        return False
+    try:
+        rep = json.loads((Path(a.out) / "loadgen" / f"{a.run}-latest.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return rep.get("fe_spans") == "sentry" and any(
+        svc == "demo-frontend" for _, tid in rows for svc, *_ in allj.get(tid, []))
 
 
 def describe(tid, allj, sent):
     a, s = allj.get(tid, []), sent.get(tid, [])
     by_svc = Counter(svc for svc, *_ in a)
-    errors = sorted({f"{svc}:{'error-marker' if name == MARKER else name}" for svc, name, code, _ in a
+    errors = sorted({f"{svc}:{'error-marker' if name == MARKER else name}" for svc, name, code, *_ in a
                      if code in (2, "STATUS_CODE_ERROR")})
     if s:
-        fate = "KEPT -> Sentry"
+        # No error / slow span, but tagged by KeepBrowserTracesMiddleware -> browser-traces policy.
+        fate = "KEPT (browser trace)" if not errors and any(sp[4] for sp in a) else "KEPT -> Sentry"
     elif not a:
         fate = "not seen by collector"
-    elif time.time() - min(t for *_, t in a) < _decision_wait_s():
+    elif time.time() - min(sp[3] for sp in a) < _decision_wait_s():
         # The tail sampler hasn't decided yet (decision_wait after the trace's first span).
         fate = "PENDING (re-run soon)"
     else:
@@ -94,6 +108,12 @@ def main():
             hint = f" Reports present: {', '.join(found)} (use RUN=<name>)." if found else ""
             raise SystemExit(f"no {report} - run `{make}` first, or pass trace ids.{hint}")
         rep = json.loads(report.read_text())
+        fe_mode = rep.get("fe_spans", "otlp (not recorded)")
+        print(f"frontend FE_SPANS={fe_mode} (read from the running frontend at run time)")
+        if fe_mode == "sentry":
+            print("  browser spans went straight to Sentry (100%), not via the collector: the outcome\n"
+                  "  below is for the BACKEND spans only; the FE spans are in Sentry either way.")
+        print()
         runs = [r for ph in rep["phases"].values() for r in ph if r and r.get("traceId")]
         rows = [(r["scenario"], r["traceId"].lower()) for r in runs]
 
@@ -107,6 +127,9 @@ def main():
         print()
         rows = rows[: a.rows]
 
+    if rep_mode_sentry(a, rows, allj):
+        print("!! FE_SPANS=sentry recorded, but demo-frontend spans reached the collector: the frontend\n"
+              "!! was rebuilt in otlp mode before/while this ran. Run `make fe-mode FE=sentry` and re-run.\n")
     print(f"{'scenario':<9} {'trace id':<32}  {'outcome':<22} {'store':>5} {'sentry':>6}  services in trace / error spans")
     for scen, tid in rows:
         fate, n_all, n_sent, svcs, errs = describe(tid, allj, sent)

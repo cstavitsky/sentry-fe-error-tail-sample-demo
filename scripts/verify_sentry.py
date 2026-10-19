@@ -413,11 +413,12 @@ class Checker:
         rep = self.runs["demo"]
         if not rep:
             return self.add("AC3", INCONC, "no demo-latest.json")
-        s1 = [r["traceId"] for r in self.by_scenario(rep).get("S1", [])]
+        # S1 (browser-started) and S13 (backend-only): error-free, fast traces that must NOT reach Sentry.
+        s1 = [r["traceId"] for s in ("S1", "S13") for r in self.by_scenario(rep).get(s, [])]
         if self.runs["mixed"]:
             s1 += [r["traceId"] for r in self.by_scenario(self.runs["mixed"]).get("S1", [])][:200]
         if not s1:
-            return self.add("AC3", INCONC, "no S1 runs")
+            return self.add("AC3", INCONC, "no S1/S13 runs")
         start, end = window(rep)
         if self.runs["mixed"]:
             ms, me = window(self.runs["mixed"])
@@ -430,7 +431,7 @@ class Checker:
         ok = not in_sentry and (jaeger_missing == [] or jaeger_api is True)
         status = PASS if ok else (FAIL if in_sentry or jaeger_missing else INCONC)
         self.add("AC3", status,
-                 f"{len(s1)} S1 traces: in Sentry={len(in_sentry)}; missing from out/collector/all.jsonl (Jaeger copy)="
+                 f"{len(s1)} S1/S13 traces: in Sentry={len(in_sentry)}; missing from out/collector/all.jsonl (Jaeger copy)="
                  f"{'n/a' if jaeger_missing is None else len(jaeger_missing)}; Jaeger API check={jaeger_api}",
                  [self.trace_url(t) for t in in_sentry[:3]] + [f"http://localhost:16686/trace/{s1[0]}"])
 

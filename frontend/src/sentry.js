@@ -8,6 +8,15 @@ const release = env.VITE_SENTRY_RELEASE || 'tail-sample-demo@0.1.0';
 const otlpUrl = env.VITE_OTLP_URL || '/otlp';
 const otlpExportUrl = `${otlpUrl.replace(/\/$/, '')}/v1/traces`;
 
+// FE_SPANS (build-time, VITE_FE_SPANS):
+//   otlp   (default) browser spans -> custom split transport -> OTel Collector, which
+//          tail-samples FE + BE together (an FE error can keep the BE spans too).
+//   sentry browser spans -> Sentry directly (stock SDK transport, no custom code),
+//          100% of FE traces. The collector only sees BE spans, so it keeps a trace
+//          only for BE errors / slow BE requests; FE-only errors keep no BE spans.
+const feSpans = env.VITE_FE_SPANS === 'sentry' ? 'sentry' : 'otlp';
+const viaCollector = feSpans === 'otlp';
+
 Sentry.init({
   dsn: env.VITE_SENTRY_DSN_FE,
   environment,
@@ -19,7 +28,8 @@ Sentry.init({
     // envelope items (what the OTLP split transport converts). Note: in stream mode
     // beforeSendTransaction / ignoreTransactions are not applied, and a beforeSendSpan
     // callback must be wrapped with Sentry.withStreamedSpan(...).
-    Sentry.spanStreamingIntegration(),
+    // (Only needed for the split transport; FE_SPANS=sentry uses classic transactions.)
+    ...(viaCollector ? [Sentry.spanStreamingIntegration()] : []),
     Sentry.replayIntegration(),
   ],
 
@@ -47,13 +57,21 @@ Sentry.init({
     return breadcrumb;
   },
 
-  // Spans -> same-origin /otlp (nginx -> collector). Everything else -> Sentry.
-  transport: makeOtlpSplitTransport({
-    collectorUrl: otlpUrl,
-    serviceName: 'demo-frontend',
-    environment,
-    release,
-  }),
+  // FE_SPANS=otlp: spans -> same-origin /otlp (nginx -> collector), everything else -> Sentry.
+  // FE_SPANS=sentry: no custom transport; everything (incl. spans) -> Sentry.
+  ...(viaCollector
+    ? {
+        transport: makeOtlpSplitTransport({
+          collectorUrl: otlpUrl,
+          serviceName: 'demo-frontend',
+          environment,
+          release,
+        }),
+      }
+    : {}),
 });
+
+Sentry.setTag('demo.fe_spans', feSpans);
+console.info(`[demo] FE_SPANS=${feSpans}: browser spans -> ${viaCollector ? 'OTel Collector (tail-sampled)' : 'Sentry directly (100%)'}`);
 
 export { Sentry };

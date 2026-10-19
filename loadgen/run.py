@@ -4,7 +4,7 @@ Playwright load generator: drives the demo UI like real users and writes a JSON
 record of every run (scenario, trace id, HTTP statuses, expected errors) to
 $OUT_DIR (default /out/loadgen) so a test can reconcile Sentry / Jaeger against it.
 
-  python run.py demo                 every scenario once (S1..S9 + S12, S6 via page reload)
+  python run.py demo                 every scenario once (S1..S9 + S12, S13, S6 via page reload)
   python run.py scenario S2 [n]      one scenario n times (default 1)
   python run.py perf                 AC6 recipe: S8 x10, then S9 x120 (10 in parallel)
   python run.py mixed [n]            S11: n traces (default 500), ~90% S1
@@ -28,7 +28,7 @@ from playwright.async_api import async_playwright
 
 ALL = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
 # Backend-only scenarios: plain HTTP from the loadgen, no browser, no traceparent.
-BACKEND_ONLY = {"S12"}
+BACKEND_ONLY = {"S12", "S13"}
 MIXED_ERRORS_AND_SLOW = ["S2", "S3", "S4", "S5", "S7"]
 
 
@@ -85,6 +85,10 @@ BACKEND_ONLY_SPEC = {
     # S12: Django -> Go, Go fails, Django returns 502. Kept by the `errors` policy:
     # Go + Django issues on a trace with no FE spans.
     "S12": {"path": "/api/v1/models/2/deployments?replica_fail=1", "expectSentry": True, "errors": {"fe": 0, "be": 2}},
+    # S13: Django only (no Go call, no error, fast). Matches no policy: DROPPED from the
+    # Sentry path, still 100% in the trace store. Also with KEEP_BROWSER_TRACES=1: no
+    # browser, so no `sentry-trace` header and nothing for the browser-traces policy.
+    "S13": {"path": "/api/v1/models", "expectSentry": False, "errors": {"fe": 0, "be": 0}},
 }
 PW = None  # set in main(): the Playwright instance, for API requests outside a browser
 
@@ -140,6 +144,17 @@ async def run_many(browser, base_url, scenarios, concurrency):
     return results
 
 
+def fe_spans_mode(base_url):
+    """FE_SPANS the *running* frontend was built with (nginx serves it as /fe-spans.txt)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"{base_url}/fe-spans.txt", timeout=5) as r:
+            v = r.read(32).decode().strip()
+        return v if v in ("otlp", "sentry") else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def summarize(runs):
     by = Counter(r.get("scenario") for r in runs)
     fe = sum((r.get("errors") or {}).get("fe", 0) for r in runs if "error" not in r)
@@ -177,6 +192,7 @@ async def main():
             phases["demo"] = await run_many(browser, base, [s for s in ALL if s != "S6"], 1)
             phases["demo"].append(await run_s6(browser, base))
             phases["demo"].append(await run_backend_only(base, "S12"))
+            phases["demo"].append(await run_backend_only(base, "S13"))
         elif a.mode == "scenario":
             sid = (a.args[0] if a.args else "S1").upper()
             n = int(a.args[1]) if len(a.args) > 1 else 1
@@ -198,6 +214,7 @@ async def main():
         "args": a.args,
         "base_url": base,
         "be_tracing_mode": os.environ.get("BE_TRACING_MODE", "otlp"),
+        "fe_spans": fe_spans_mode(base),
         "started": started,
         "finished": datetime.now(timezone.utc).isoformat(),
         "duration_s": round(time.time() - t0, 1),

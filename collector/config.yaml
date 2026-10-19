@@ -133,6 +133,16 @@ processors:
           error_mode: ignore
           span:
             - 'kind == SPAN_KIND_SERVER and end_time_unix_nano - start_time_unix_nano >= ${env:TAIL_LATENCY_MS:-1000} * 1000000'
+      # Keep the whole trace of every *sampled browser request* (Django puts
+      # sentry.browser_trace="true" on its server span, see demo/keep_browser_traces.py).
+      # Only active with KEEP_BROWSER_TRACES=1, meant for FE_SPANS=sentry (browser spans
+      # sent straight to Sentry at 100%): then FE-only errors still get their BE spans.
+      # Inert otherwise (nothing sets the attribute).
+      - name: browser-traces
+        type: string_attribute
+        string_attribute:
+          key: sentry.browser_trace
+          values: ["true"]
 
   # FE "error marker" spans exist only to tell the tail sampler that a browser error
   # happened in this trace. Drop them after the decision so they never reach Sentry.
